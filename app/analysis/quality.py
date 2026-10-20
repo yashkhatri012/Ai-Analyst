@@ -1,22 +1,27 @@
 
+"""Rule based data quality analysis for Pandas DataFrames using semantic_types"""
+
 from __future__ import annotations
 
 import re
-import warnings
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pandas as pd
-from pandas.api.types import (
-    is_numeric_dtype,
-    is_object_dtype,
-    is_string_dtype,
+
+from app.analysis.semantic_types import infer_semantic_type
+
+
+IDENTIFIER_NAME = re.compile(
+    r"(^|[_\s-])(id|uuid|guid|identifier|index|key)($|[_\s-])",
+    re.IGNORECASE,
 )
 
 
 @dataclass(frozen=True)
 class QualityConfig:
-    """Configurable thresholds for generic quality checks."""
+    """Configurable thresholds for quality checks"""
 
     missing_medium_pct: float = 5.0
     missing_high_pct: float = 30.0
@@ -29,206 +34,46 @@ class QualityConfig:
     categorical_max_average_length: float = 50.0
 
     outlier_iqr_multiplier: float = 1.5
-    minimum_outlier_count: int = 1
+    minimum_outlier_count: int = 3
 
-    examples_limit: int = 5
-    category_groups_limit: int = 10
+    max_examples: int = 5
+    max_category_groups: int = 10
+
+    # Zero checks are opt in because zero may be a valid value.
+    suspicious_zero_columns: tuple[str, ...] = ()
+    suspicious_zero_min_pct: float = 50.0
 
 
 DEFAULT_CONFIG = QualityConfig()
 
-IDENTIFIER_NAME_PATTERN = re.compile(
-    r"(^|[_\W])(id|uuid|guid|index|key|identifier)([_\W]|$)",
-    flags=re.IGNORECASE,
-)
 
-DATE_NAME_PATTERN = re.compile(
-    r"(^|[_\W])(date|datetime|timestamp)([_\W]|$)",
-    flags=re.IGNORECASE,
-)
+def _safe_number(value: Any) -> int | float | None:
+    """Convert numeric values into JSON safe Python scalars."""
+    if value is None or pd.isna(value):
+        return None
 
-NUMERIC_TEXT_PATTERN = re.compile(
-    r"""
-    ^[+-]?
-    (?:
-        (?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?
-        |
-        \.\d+
-    )
-    (?:[eE][+-]?\d+)?$
-    """,
-    flags=re.VERBOSE,
-)
+    if isinstance(value, (np.integer,)):
+        return int(value)
 
-DATE_LIKE_PATTERN = re.compile(
-    r"""
-    \d{1,4}[-/]\d{1,2}[-/]\d{1,4}
-    |
-    \d{4}-\d{2}
-    |
-    \d{4}-\d{2}-\d{2}[T\s]
-    """,
-    flags=re.VERBOSE,
-)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        return number if np.isfinite(number) else None
+
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+
+    return value
 
 
-def _is_string_column(series: pd.Series) -> bool:
-    return is_object_dtype(series) or is_string_dtype(series)
-
-
-def _is_identifier_candidate(
-    column: Any,
-    series: pd.Series,
+def _severity_for_missing(
+    percentage: float,
     config: QualityConfig,
-) -> bool:
-    """
-    Infer likely identifiers from generic name patterns or sequential values.
-
-    High cardinality alone is not sufficient: continuous measurements can
-    legitimately have many distinct values.
-    """
-    name = str(column).strip()
-    values = series.dropna()
-
-    if values.empty or values.nunique() < 2:
-        return False
-
-    unique_ratio = values.nunique() / len(values)
-
-    if unique_ratio < config.identifier_unique_ratio:
-        return False
-
-    if IDENTIFIER_NAME_PATTERN.search(name):
-        return True
-
-    # A secondary heuristic for unnamed sequential integer identifiers.
-    if is_numeric_dtype(series) and not values.empty:
-        numeric = pd.to_numeric(values, errors="coerce").dropna()
-
-        if (
-            len(numeric) == len(values)
-            and (numeric % 1 == 0).all()
-            and numeric.nunique() == len(numeric)
-        ):
-            ordered = numeric.sort_values().reset_index(drop=True)
-            differences = ordered.diff().dropna()
-
-            # Sequential integers are evidence, not proof, of an identifier.
-            if (
-                not differences.empty
-                and (differences == 1).mean() >= 0.90
-            ):
-                return True
-
-    return False
-
-
-def _missing_severity(
-    missing_percentage: float,
-    config: QualityConfig,
-) -> str:
-    if missing_percentage >= config.missing_high_pct:
+) -> str | None:
+    if percentage >= config.missing_high_pct:
         return "high"
-    if missing_percentage >= config.missing_medium_pct:
+    if percentage >= config.missing_medium_pct:
         return "medium"
-    return "low"
-
-
-def _looks_structured(series: pd.Series) -> bool:
-    """Avoid interpreting serialized arrays/objects as categorical labels."""
-    values = series.dropna().astype(str).str.strip().head(100)
-
-    if values.empty:
-        return False
-
-    structured_ratio = values.str.startswith(
-        ("[", "{", "(", "array(")
-    ).mean()
-
-    return bool(structured_ratio >= 0.70)
-
-
-def _looks_categorical(
-    series: pd.Series,
-    config: QualityConfig,
-) -> bool:
-    """
-    Conservative heuristic for low-cardinality string categories.
-
-    This is an inference, not a guarantee that the column is categorical.
-    """
-    values = series.dropna().astype(str).str.strip()
-
-    if len(values) < 2 or values.empty:
-        return False
-
-    if _looks_structured(series):
-        return False
-
-    unique_ratio = values.nunique() / len(values)
-    average_length = float(values.str.len().mean())
-
-    return (
-        unique_ratio <= config.categorical_max_unique_ratio
-        and average_length <= config.categorical_max_average_length
-    )
-
-
-def _numeric_parse_ratio(series: pd.Series) -> tuple[float, int]:
-    """Return the parse ratio and number of non-null strings examined."""
-    values = series.dropna().astype(str).str.strip()
-
-    if values.empty:
-        return 0.0, 0
-
-    # Require a numeric-looking textual format before attempting conversion.
-    numeric_format = values.map(
-        lambda value: bool(NUMERIC_TEXT_PATTERN.fullmatch(value))
-    )
-
-    return float(numeric_format.mean()), len(values)
-
-
-def _date_parse_ratio(
-    column: Any,
-    series: pd.Series,
-) -> tuple[float, int, list[str]]:
-    """
-    Detect date-like strings using both parseability and format evidence.
-
-    A column name can support detection, but cannot establish it by itself.
-    """
-    values = series.dropna().astype(str).str.strip()
-
-    if values.empty:
-        return 0.0, 0, []
-
-    name_suggests_date = bool(DATE_NAME_PATTERN.search(str(column)))
-    value_suggests_date = values.map(
-        lambda value: bool(DATE_LIKE_PATTERN.search(value))
-    )
-
-    if not name_suggests_date and not value_suggests_date.any():
-        return 0.0, len(values), []
-
-    # Explicit format evidence reduces false positives from arbitrary strings.
-    candidate_values = values[
-        value_suggests_date
-        if value_suggests_date.any()
-        else values.index.isin(values.index)
-    ]
-
-    if candidate_values.empty:
-        return 0.0, len(values), []
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        parsed = pd.to_datetime(candidate_values, errors="coerce")
-
-    ratio = float(parsed.notna().mean())
-    examples = parsed.dropna().astype(str).head(3).tolist()
-
-    return ratio, len(candidate_values), examples
+    return None
 
 
 def _add_finding(
@@ -253,6 +98,97 @@ def _add_finding(
     )
 
 
+def _sample_values(series: pd.Series, limit: int) -> list[Any]:
+    """Return a small set of JSON safe example values."""
+    values = series.dropna().drop_duplicates().head(limit)
+    return [str(value) for value in values.tolist()]
+
+
+def _is_identifier(
+    name: str,
+    series: pd.Series,
+    semantic: dict[str, Any],
+    config: QualityConfig,
+) -> bool:
+    """Use semantic inference, column names, and uniqueness as signals."""
+    if semantic["semantic_type"] == "identifier":
+        return True
+
+    if IDENTIFIER_NAME.search(name):
+        return True
+
+    non_missing = series.dropna()
+    if non_missing.empty:
+        return False
+
+    # High uniqueness alone is not enough to classify a numeric measure
+    # as an identifier. Require a name hint or string like values.
+    if not pd.api.types.is_numeric_dtype(series):
+        unique_ratio = non_missing.nunique() / len(non_missing)
+        if unique_ratio >= config.identifier_unique_ratio:
+            return True
+
+    return False
+
+
+def _parse_ratio(series: pd.Series, parser: str) -> tuple[float, int]:
+    """Return parse success ratio and number of non empty values."""
+    values = series.dropna().astype("string").str.strip()
+    values = values[values.ne("")].dropna()
+
+    if values.empty:
+        return 0.0, 0
+
+    if parser == "numeric":
+        parsed = pd.to_numeric(values, errors="coerce")
+    elif parser == "datetime":
+        parsed = pd.to_datetime(values, errors="coerce", format="mixed")
+    else:
+        raise ValueError(f"Unsupported parser: {parser}")
+
+    return float(parsed.notna().mean()), len(values)
+
+
+def _category_inconsistencies(
+    series: pd.Series,
+    config: QualityConfig,
+) -> list[dict[str, Any]]:
+    """
+    Find text values that differ only by case or surrounding whitespace.
+
+    Examples: 'Action', ' action', and 'ACTION'.
+    """
+    values = series.dropna().astype("string")
+    values = values[values.str.strip().ne("")]
+
+    if values.empty:
+        return []
+
+    groups: dict[str, set[str]] = {}
+
+    for value in values.unique():
+        original = str(value)
+        normalized = original.strip().casefold()
+        groups.setdefault(normalized, set()).add(original)
+
+    inconsistent = [
+        {
+            "normalized_value": normalized,
+            "variants": sorted(variants)[: config.max_examples],
+            "variant_count": len(variants),
+        }
+        for normalized, variants in groups.items()
+        if len(variants) > 1
+    ]
+
+    inconsistent.sort(
+        key=lambda item: item["variant_count"],
+        reverse=True,
+    )
+
+    return inconsistent[: config.max_category_groups]
+
+
 def _check_missing_values(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
@@ -264,38 +200,44 @@ def _check_missing_values(
         return
 
     for column in df.columns:
-        missing_count = int(df[column].isna().sum())
+        series = df[column]
+        missing_count = int(series.isna().sum())
 
         if missing_count == 0:
             continue
 
-        missing_percentage = round(missing_count / row_count * 100, 2)
+        missing_pct = missing_count / row_count * 100
+        severity = _severity_for_missing(missing_pct, config)
+
+        if severity is None:
+            continue
 
         _add_finding(
             findings,
             rule_id="MISSING_VALUES",
-            severity=_missing_severity(missing_percentage, config),
+            severity=severity,
             title=f"Missing values in '{column}'",
             columns=[str(column)],
             evidence={
                 "missing_count": missing_count,
-                "missing_percentage": missing_percentage,
+                "total_rows": row_count,
+                "missing_percentage": round(missing_pct, 2),
+                "examples_of_non_missing_values": _sample_values(
+                    series, config.max_examples
+                ),
             },
             recommendation=(
-                "Determine whether missingness is expected for this field "
-                "and assess its impact before choosing an imputation, "
-                "exclusion, or retention strategy."
+                "Determine whether these values are genuinely unknown, "
+                "not applicable, or missing due to data collection. "
+                "Choose an appropriate handling strategy before analysis."
             ),
         )
 
 
-def _check_duplicate_rows(
+def _check_duplicates(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
 ) -> None:
-    if df.empty:
-        return
-
     duplicate_count = int(df.duplicated().sum())
 
     if duplicate_count == 0:
@@ -306,286 +248,312 @@ def _check_duplicate_rows(
         rule_id="DUPLICATE_ROWS",
         severity="medium",
         title="Duplicate rows detected",
-        columns=[],
+        columns=[str(column) for column in df.columns],
         evidence={
-            "duplicate_rows": duplicate_count,
+            "duplicate_row_count": duplicate_count,
+            "total_rows": len(df),
             "duplicate_percentage": round(
                 duplicate_count / len(df) * 100, 2
-            ),
+            ) if len(df) else 0.0,
         },
         recommendation=(
             "Inspect duplicate records and determine whether they are "
-            "accidental duplicates or valid repeated observations."
+            "legitimate repeated observations or accidental duplicates. "
+            "Do not remove them automatically."
         ),
     )
 
 
-def _check_constant_columns(
+def _check_column_structure(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
+    config: QualityConfig,
 ) -> None:
     for column in df.columns:
         series = df[column]
-        unique_count = int(series.nunique(dropna=True))
+        name = str(column)
+        non_missing = series.dropna()
 
         if series.isna().all():
             _add_finding(
                 findings,
                 rule_id="ALL_NULL_COLUMN",
-                severity="medium",
-                title=f"Column '{column}' contains only missing values",
-                columns=[str(column)],
-                evidence={"missing_count": int(series.isna().sum())},
+                severity="high",
+                title=f"Column '{name}' contains only missing values",
+                columns=[name],
+                evidence={"row_count": len(series)},
                 recommendation=(
-                    "Verify whether this column is expected to contain "
-                    "values before deciding whether it should be retained."
+                    "Verify whether this column was expected to contain "
+                    "data. Populate it from a reliable source or remove it "
+                    "if it has no analytical purpose."
                 ),
             )
-        elif len(series) > 0 and unique_count <= 1:
+            continue
+
+        if non_missing.nunique() <= 1:
             _add_finding(
                 findings,
                 rule_id="CONSTANT_COLUMN",
                 severity="low",
-                title=f"Column '{column}' has no variation",
-                columns=[str(column)],
-                evidence={"unique_non_null_values": unique_count},
+                title=f"Column '{name}' has no variation",
+                columns=[name],
+                evidence={
+                    "unique_non_missing_values": int(non_missing.nunique()),
+                    "example_values": _sample_values(
+                        non_missing, config.max_examples
+                    ),
+                },
                 recommendation=(
-                    "Assess whether this column contributes useful "
-                    "information to the intended analysis."
+                    "Check whether the constant value is expected. "
+                    "A column without variation generally contributes "
+                    "little to comparative or predictive analysis."
                 ),
             )
 
 
-def _check_identifiers(
+def _check_text_parsing(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
+    semantics: dict[str, dict[str, Any]],
     config: QualityConfig,
-) -> set[Any]:
-    """
-    Return likely identifier columns so they can be excluded from outlier checks.
-    """
-    identifiers: set[Any] = set()
-
+) -> None:
     for column in df.columns:
         series = df[column]
+        name = str(column)
 
-        if not _is_identifier_candidate(column, series, config):
+        # Native numeric and datetime columns do not need text parsing.
+        if (
+            pd.api.types.is_numeric_dtype(series)
+            or pd.api.types.is_datetime64_any_dtype(series)
+            or pd.api.types.is_bool_dtype(series)
+        ):
             continue
 
-        identifiers.add(column)
-        values = series.dropna()
-        unique_ratio = values.nunique() / max(len(values), 1)
+        semantic = semantics[name]
+        semantic_type = semantic["semantic_type"]
 
-        _add_finding(
-            findings,
-            rule_id="POTENTIAL_IDENTIFIER",
-            severity="low",
-            title=f"Column '{column}' may be an identifier",
-            columns=[str(column)],
-            evidence={
-                "unique_ratio": round(unique_ratio, 4),
-                "unique_values": int(values.nunique()),
-                "non_null_rows": int(len(values)),
-                "detection_basis": (
-                    "column_name_or_sequential_integer_pattern"
+        # An identifier may contain digits, but converting it to a number
+        # could destroy leading zeros or its meaning as a label.
+        if semantic_type == "identifier":
+            continue
+
+        numeric_ratio, numeric_count = _parse_ratio(series, "numeric")
+
+        if (
+            numeric_count > 0
+            and numeric_ratio >= config.numeric_parse_ratio
+        ):
+            _add_finding(
+                findings,
+                rule_id="NUMERIC_STORED_AS_TEXT",
+                severity="medium",
+                title=f"Numeric values in '{name}' are stored as text",
+                columns=[name],
+                evidence={
+                    "parse_success_ratio": round(numeric_ratio, 3),
+                    "non_empty_values_checked": numeric_count,
+                    "semantic_type": semantic_type,
+                    "semantic_type_confidence": semantic["confidence"],
+                    "examples": _sample_values(
+                        series, config.max_examples
+                    ),
+                },
+                recommendation=(
+                    "Validate the column's meaning and formatting before "
+                    "converting it to a numeric dtype. Preserve identifiers, "
+                    "leading zeros, currency conventions, and special codes."
                 ),
-            },
-            recommendation=(
-                "Confirm whether this column identifies records. If it does, "
-                "exclude it from analyses that interpret the identifier as "
-                "a meaningful measurement."
-            ),
-        )
+            )
+            continue
 
-    return identifiers
+        date_ratio, date_count = _parse_ratio(series, "datetime")
+
+        if (
+            date_count > 0
+            and date_ratio >= config.date_parse_ratio
+            and semantic_type == "datetime"
+        ):
+            _add_finding(
+                findings,
+                rule_id="DATE_STORED_AS_TEXT",
+                severity="low",
+                title=f"Date values in '{name}' are stored as text",
+                columns=[name],
+                evidence={
+                    "parse_success_ratio": round(date_ratio, 3),
+                    "non_empty_values_checked": date_count,
+                    "examples": _sample_values(
+                        series, config.max_examples
+                    ),
+                },
+                recommendation=(
+                    "Validate date formats and convert the column to a "
+                    "datetime dtype if date-based filtering, sorting, or "
+                    "time-series analysis is required."
+                ),
+            )
 
 
 def _check_numeric_outliers(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
-    identifier_columns: set[Any],
+    identifiers: set[str],
     config: QualityConfig,
 ) -> None:
     for column in df.columns:
+        name = str(column)
         series = df[column]
 
-        if column in identifier_columns or not is_numeric_dtype(series):
+        if name in identifiers:
+            continue
+
+        if not pd.api.types.is_numeric_dtype(series):
+            continue
+
+        if pd.api.types.is_bool_dtype(series):
             continue
 
         values = series.dropna()
 
-        if len(values) < 4:
+        # Very small samples do not support a useful outlier assessment.
+        if len(values) < 4 or values.nunique() < 2:
             continue
 
         q1 = values.quantile(0.25)
         q3 = values.quantile(0.75)
         iqr = q3 - q1
 
-        # No useful IQR fence when the distribution has zero spread.
-        if pd.isna(iqr) or iqr <= 0:
+        # If the IQR is zero, the conventional IQR rule is not informative.
+        if not np.isfinite(iqr) or iqr <= 0:
             continue
 
-        lower_bound = q1 - config.outlier_iqr_multiplier * iqr
-        upper_bound = q3 + config.outlier_iqr_multiplier * iqr
+        lower = q1 - config.outlier_iqr_multiplier * iqr
+        upper = q3 + config.outlier_iqr_multiplier * iqr
 
-        outliers = values[(values < lower_bound) | (values > upper_bound)]
-        outlier_count = int(len(outliers))
+        mask = (values < lower) | (values > upper)
+        outliers = values[mask]
 
-        if outlier_count < config.minimum_outlier_count:
+        if len(outliers) < config.minimum_outlier_count:
             continue
 
         _add_finding(
             findings,
-            rule_id="POTENTIAL_OUTLIERS",
+            rule_id="POTENTIAL_NUMERIC_OUTLIERS",
             severity="low",
-            title=f"Potential outliers in '{column}'",
-            columns=[str(column)],
+            title=f"Potential statistical outliers in '{name}'",
+            columns=[name],
             evidence={
-                "outlier_count": outlier_count,
+                "outlier_count": int(len(outliers)),
+                "non_missing_values": int(len(values)),
                 "outlier_percentage": round(
-                    outlier_count / len(values) * 100, 2
+                    len(outliers) / len(values) * 100, 2
                 ),
-                "method": f"{config.outlier_iqr_multiplier} × IQR rule",
-                "lower_bound": float(lower_bound),
-                "upper_bound": float(upper_bound),
-                "examples": outliers.head(config.examples_limit).tolist(),
+                "q1": _safe_number(q1),
+                "q3": _safe_number(q3),
+                "iqr": _safe_number(iqr),
+                "lower_bound": _safe_number(lower),
+                "upper_bound": _safe_number(upper),
+                "examples": [
+                    _safe_number(value)
+                    for value in outliers.head(config.max_examples).tolist()
+                ],
+                "method": "IQR",
+                "multiplier": config.outlier_iqr_multiplier,
             },
             recommendation=(
-                "Inspect extreme observations in context. Statistical "
-                "outliers are not necessarily errors and should not be "
-                "removed automatically."
+                "Inspect extreme values in context. They may be valid rare "
+                "observations, skewed-distribution effects, or data errors; "
+                "do not remove them solely because this rule flagged them."
             ),
         )
 
 
-def _check_numeric_text(
+def _check_suspicious_zeros(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
-    identifier_columns: set[Any],
     config: QualityConfig,
 ) -> None:
-    for column in df.columns:
-        series = df[column]
-
-        if column in identifier_columns or not _is_string_column(series):
+    for column in config.suspicious_zero_columns:
+        if column not in df.columns:
             continue
 
-        values = series.dropna().astype(str).str.strip()
+        series = df[column]
 
+        if not pd.api.types.is_numeric_dtype(series):
+            continue
+
+        if pd.api.types.is_bool_dtype(series):
+            continue
+
+        values = series.dropna()
         if values.empty:
             continue
 
-        parse_ratio, checked_count = _numeric_parse_ratio(series)
+        zero_count = int((values == 0).sum())
+        zero_pct = zero_count / len(values) * 100
 
-        if parse_ratio < config.numeric_parse_ratio:
+        if zero_count == 0 or zero_pct < config.suspicious_zero_min_pct:
             continue
 
-        # A textual column with numeric-looking values might be a code or ID.
-        # This finding recommends inspection rather than automatic conversion.
         _add_finding(
             findings,
-            rule_id="NUMERIC_STORED_AS_TEXT",
+            rule_id="HIGH_ZERO_PROPORTION",
             severity="low",
-            title=f"Column '{column}' may contain numbers stored as text",
+            title=f"High proportion of zeros in '{column}'",
             columns=[str(column)],
             evidence={
-                "numeric_parse_ratio": round(parse_ratio, 4),
-                "non_null_values_checked": checked_count,
-                "examples": values.head(config.examples_limit).tolist(),
+                "zero_count": zero_count,
+                "non_missing_values": int(len(values)),
+                "zero_percentage": round(zero_pct, 2),
             },
             recommendation=(
-                "Check the column's meaning, formatting, leading zeros, and "
-                "units. Convert it to numeric only if it represents a "
-                "quantitative measurement rather than a code or identifier."
+                "Confirm whether zero means a genuine measured value, "
+                "a valid absence, an unknown value, or a placeholder. "
+                "Do not replace zeros without domain justification."
             ),
         )
 
 
-def _check_date_text(
+def _check_category_inconsistency(
     df: pd.DataFrame,
     findings: list[dict[str, Any]],
+    semantics: dict[str, dict[str, Any]],
     config: QualityConfig,
 ) -> None:
     for column in df.columns:
+        name = str(column)
         series = df[column]
 
-        if not _is_string_column(series):
+        if not (
+            pd.api.types.is_object_dtype(series)
+            or isinstance(series.dtype, pd.StringDtype)
+            or pd.api.types.is_categorical_dtype(series)
+        ):
             continue
 
-        ratio, checked_count, examples = _date_parse_ratio(column, series)
+        semantic = semantics[name]
+        if semantic["semantic_type"] not in {"categorical", "text"}:
+            continue
 
-        if ratio < config.date_parse_ratio:
+        inconsistencies = _category_inconsistencies(series, config)
+
+        if not inconsistencies:
             continue
 
         _add_finding(
             findings,
-            rule_id="DATE_STORED_AS_TEXT",
+            rule_id="INCONSISTENT_TEXT_CATEGORIES",
             severity="low",
-            title=f"Column '{column}' may contain dates stored as text",
-            columns=[str(column)],
+            title=f"Case or whitespace inconsistencies in '{name}'",
+            columns=[name],
             evidence={
-                "date_parse_ratio": round(ratio, 4),
-                "values_checked": checked_count,
-                "parsed_examples": examples,
+                "inconsistent_groups_found": len(inconsistencies),
+                "groups": inconsistencies,
             },
             recommendation=(
-                "Validate the date format and intended timezone, then parse "
-                "the column to a datetime dtype if appropriate."
-            ),
-        )
-
-
-def _check_inconsistent_categories(
-    df: pd.DataFrame,
-    findings: list[dict[str, Any]],
-    config: QualityConfig,
-) -> None:
-    for column in df.columns:
-        series = df[column]
-
-        if not _is_string_column(series):
-            continue
-
-        if not _looks_categorical(series, config):
-            continue
-
-        values = series.dropna().astype(str)
-        normalized_groups: dict[str, set[str]] = {}
-
-        for value in values:
-            normalized = value.strip().casefold()
-
-            if normalized:
-                normalized_groups.setdefault(normalized, set()).add(value)
-
-        inconsistent_groups = [
-            {
-                "normalized_value": normalized,
-                "observed_values": sorted(observed)[
-                    :config.examples_limit
-                ],
-            }
-            for normalized, observed in normalized_groups.items()
-            if len(observed) > 1
-        ]
-
-        if not inconsistent_groups:
-            continue
-
-        _add_finding(
-            findings,
-            rule_id="INCONSISTENT_CATEGORIES",
-            severity="low",
-            title=f"Potentially inconsistent labels in '{column}'",
-            columns=[str(column)],
-            evidence={
-                "groups": inconsistent_groups[:config.category_groups_limit],
-                "groups_detected": len(inconsistent_groups),
-            },
-            recommendation=(
-                "Review labels that differ only by capitalization or "
-                "surrounding whitespace. Standardize them only if they "
-                "represent the same category."
+                "Review the variants and normalize whitespace or letter "
+                "case where they represent the same category. Avoid "
+                "normalizing free text when case or spacing is meaningful."
             ),
         )
 
@@ -596,39 +564,62 @@ def analyze_quality(
     config: QualityConfig = DEFAULT_CONFIG,
 ) -> dict[str, Any]:
     """
-    Run generic, deterministic quality checks on a DataFrame.
+    Analyze a DataFrame and return structured data-quality findings.
 
-    `profile` is retained for API compatibility. These checks calculate the
-    evidence they need directly from `df` to avoid stale or mismatched profile
-    statistics.
+    `profile` is accepted for compatibility with the API but is not used
+    as the source of truth. All checks are computed from the current DataFrame.
     """
-    del profile  # Reserved for future checks that can safely reuse the profile.
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Expected a pandas DataFrame")
+
+    if not isinstance(config, QualityConfig):
+        raise TypeError("config must be a QualityConfig instance")
+
+    if df.columns.duplicated().any():
+        raise ValueError(
+            "DataFrame contains duplicate column names; rename them "
+            "before running quality analysis."
+        )
 
     findings: list[dict[str, Any]] = []
 
-    _check_missing_values(df, findings, config)
-    _check_duplicate_rows(df, findings)
-    _check_constant_columns(df, findings)
+    # Empty datasets have limited meaningful quality signals.
+    if df.empty or len(df.columns) == 0:
+        return {
+            "summary": {
+                "total_findings": 0,
+                "severity_counts": {
+                    "high": 0,
+                    "medium": 0,
+                    "low": 0,
+                },
+            },
+            "findings": [],
+        }
 
-    identifier_columns = _check_identifiers(df, findings, config)
+    semantics: dict[str, dict[str, Any]] = {
+        str(column): infer_semantic_type(df[column], str(column))
+        for column in df.columns
+    }
 
-    _check_numeric_outliers(
-        df, findings, identifier_columns, config
-    )
-    _check_numeric_text(
-        df, findings, identifier_columns, config
-    )
-    _check_date_text(df, findings, config)
-    _check_inconsistent_categories(df, findings, config)
-
-    severity_rank = {"high": 0, "medium": 1, "low": 2}
-    findings.sort(
-        key=lambda item: (
-            severity_rank.get(item["severity"], 3),
-            item["rule_id"],
-            item["columns"],
+    identifiers = {
+        str(column)
+        for column in df.columns
+        if _is_identifier(
+            str(column),
+            df[column],
+            semantics[str(column)],
+            config,
         )
-    )
+    }
+
+    _check_missing_values(df, findings, config)
+    _check_duplicates(df, findings)
+    _check_column_structure(df, findings, config)
+    _check_text_parsing(df, findings, semantics, config)
+    _check_numeric_outliers(df, findings, identifiers, config)
+    _check_suspicious_zeros(df, findings, config)
+    _check_category_inconsistency(df, findings, semantics, config)
 
     severity_counts = {
         severity: sum(
