@@ -2,6 +2,7 @@
 from fastapi import APIRouter, File, UploadFile
 
 from app.analysis.profiler import profile_dataset
+from app.analysis.quality import analyze_quality
 from app.ingestion.loader import ingest_csv
 
 router = APIRouter()
@@ -27,4 +28,19 @@ async def profile_csv(file: UploadFile = File(...)):
         "message": "CSV profiled successfully",
         "metadata": dataset.metadata,
         "profile": profile,
+    }
+
+
+@router.post("/datasets/analyze-quality")
+async def analyze_dataset_quality(file: UploadFile = File(...)):
+    dataset = await ingest_csv(file)
+    df = dataset.dataframe
+
+    profile = profile_dataset(df)
+    quality = analyze_quality(df, profile)
+
+    return {
+        "metadata": dataset.metadata,
+        "profile": profile,
+        "quality": quality,
     }
