@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-TOP_N = 10
+TOP_N = 3
 
 
 def _clean_number(value: Any) -> Any:
