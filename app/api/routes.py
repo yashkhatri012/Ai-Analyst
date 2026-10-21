@@ -1,6 +1,7 @@
 
 from fastapi import APIRouter, File, UploadFile
 
+from app.analysis.context_builder import build_agent_context
 from app.analysis.profiler import profile_dataset
 from app.analysis.quality import analyze_quality
 from app.ingestion.loader import ingest_csv
@@ -35,11 +36,9 @@ async def analyze_dataset_quality(file: UploadFile = File(...)):
     dataset = await ingest_csv(file)
     df = dataset.dataframe
 
-    profile = profile_dataset(df)
-    quality = analyze_quality(df, profile)
+    context = build_agent_context(dataset.dataframe)
 
     return {
         "metadata": dataset.metadata,
-        "profile": profile,
-        "quality": quality,
+        "context": context
     }

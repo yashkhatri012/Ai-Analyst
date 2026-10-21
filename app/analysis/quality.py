@@ -10,6 +10,10 @@ import pandas as pd
 
 from app.analysis.semantic_types import (
     infer_semantic_type,
+    
+)
+from app.analysis.helper import (
+    _clean_number,
     is_identifier_name,
     parse_datetimes,
     parse_numeric,
@@ -44,22 +48,7 @@ class QualityConfig:
 DEFAULT_CONFIG = QualityConfig()
 
 
-def _safe_number(value: Any) -> int | float | None:
-    """Convert numeric values into JSON safe Python scalars."""
-    if value is None or pd.isna(value):
-        return None
 
-    if isinstance(value, (np.integer,)):
-        return int(value)
-
-    if isinstance(value, (np.floating, float)):
-        number = float(value)
-        return number if np.isfinite(number) else None
-
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-
-    return value
 
 
 def _severity_for_missing(
@@ -450,13 +439,13 @@ def _check_numeric_outliers(
                 "outlier_percentage": round(
                     len(outliers) / len(values) * 100, 2
                 ),
-                "q1": _safe_number(q1),
-                "q3": _safe_number(q3),
-                "iqr": _safe_number(iqr),
-                "lower_bound": _safe_number(lower),
-                "upper_bound": _safe_number(upper),
+                "q1": _clean_number(q1),
+                "q3": _clean_number(q3),
+                "iqr": _clean_number(iqr),
+                "lower_bound": _clean_number(lower),
+                "upper_bound": _clean_number(upper),
                 "examples": [
-                    _safe_number(value)
+                    _clean_number(value)
                     for value in outliers.head(config.max_examples).tolist()
                 ],
                 "method": "IQR",
