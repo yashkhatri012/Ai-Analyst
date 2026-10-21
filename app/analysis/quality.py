@@ -1,21 +1,18 @@
-
 """Rule based data quality analysis for Pandas DataFrames using semantic_types"""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from app.analysis.semantic_types import infer_semantic_type
-
-
-IDENTIFIER_NAME = re.compile(
-    r"(^|[_\s-])(id|uuid|guid|identifier|index|key)($|[_\s-])",
-    re.IGNORECASE,
+from app.analysis.semantic_types import (
+    infer_semantic_type,
+    is_identifier_name,
+    parse_datetimes,
+    parse_numeric,
 )
 
 
@@ -114,7 +111,7 @@ def _is_identifier(
     if semantic["semantic_type"] == "identifier":
         return True
 
-    if IDENTIFIER_NAME.search(name):
+    if is_identifier_name(name):
         return True
 
     non_missing = series.dropna()
@@ -140,9 +137,9 @@ def _parse_ratio(series: pd.Series, parser: str) -> tuple[float, int]:
         return 0.0, 0
 
     if parser == "numeric":
-        parsed = pd.to_numeric(values, errors="coerce")
+        parsed = parse_numeric(values)
     elif parser == "datetime":
-        parsed = pd.to_datetime(values, errors="coerce", format="mixed")
+        parsed = parse_datetimes(values)
     else:
         raise ValueError(f"Unsupported parser: {parser}")
 
@@ -204,6 +201,11 @@ def _check_missing_values(
         missing_count = int(series.isna().sum())
 
         if missing_count == 0:
+            continue
+
+        # Fully empty columns are reported by ALL_NULL_COLUMN instead,
+        # to avoid two findings for the same problem.
+        if missing_count == row_count:
             continue
 
         missing_pct = missing_count / row_count * 100
@@ -527,7 +529,7 @@ def _check_category_inconsistency(
         if not (
             pd.api.types.is_object_dtype(series)
             or isinstance(series.dtype, pd.StringDtype)
-            or pd.api.types.is_categorical_dtype(series)
+            or isinstance(series.dtype, pd.CategoricalDtype)
         ):
             continue
 
@@ -583,18 +585,30 @@ def analyze_quality(
 
     findings: list[dict[str, Any]] = []
 
-    # Empty datasets have limited meaningful quality signals.
+    # An empty dataset must not look "clean" to the agent: report it.
     if df.empty or len(df.columns) == 0:
+        _add_finding(
+            findings,
+            rule_id="EMPTY_DATASET",
+            severity="high",
+            title="Dataset has no rows or no columns",
+            columns=[str(column) for column in df.columns],
+            evidence={
+                "row_count": int(len(df)),
+                "column_count": int(len(df.columns)),
+            },
+            recommendation=(
+                "Check the source file, delimiter, header row, and any "
+                "filters applied during ingestion. No further quality "
+                "checks were run."
+            ),
+        )
         return {
             "summary": {
-                "total_findings": 0,
-                "severity_counts": {
-                    "high": 0,
-                    "medium": 0,
-                    "low": 0,
-                },
+                "total_findings": 1,
+                "severity_counts": {"high": 1, "medium": 0, "low": 0},
             },
-            "findings": [],
+            "findings": findings,
         }
 
     semantics: dict[str, dict[str, Any]] = {

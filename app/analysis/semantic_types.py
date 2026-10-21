@@ -1,56 +1,28 @@
-
 """Infer semantic types without modifying the source DataFrame"""
 
-import re
-from typing import Any
+from __future__ import annotations
 
 import pandas as pd
-
-
-SAMPLE_SIZE = 1000
-NUMERIC_PARSE_THRESHOLD = 0.95
-DATE_PARSE_THRESHOLD = 0.80
-CATEGORICAL_UNIQUE_RATIO = 0.20
-MAX_CATEGORY_LENGTH = 50
-
-IDENTIFIER_NAME = re.compile(
-    r"(^|[_\s-])(id|uuid|guid|identifier|index|key)($|[_\s-])",
-    re.IGNORECASE,
-)
-DATE_NAME = re.compile(
-    r"(^|[_\s-])(date|datetime|timestamp|time)($|[_\s-])",
-    re.IGNORECASE,
-)
-BOOLEAN_NAME = re.compile(
-    r"(^|[_\s-])(is|has|was|can|enabled|active|valid|flag)($|[_\s-])",
-    re.IGNORECASE,
-)
-DATE_PATTERN = re.compile(
-    r"^\s*(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}"
-    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+from typing import Any
+from app.analysis.helper import (
+    
+    normalize_name,
+    _sample,
+    _result,
+    parse_numeric,
+    parse_datetimes,
+    IDENTIFIER_NAME,
+    BOOLEAN_NAME,
+    DATE_PATTERN,
+    
+    NUMERIC_PARSE_THRESHOLD,
+    DATE_PARSE_THRESHOLD,
+    CATEGORICAL_UNIQUE_RATIO,
+    DATE_NAME,
+    MAX_CATEGORY_LENGTH
+    
 )
 
-
-def _sample(series: pd.Series) -> pd.Series:
-    """Take a reproducible sample for inference on large columns."""
-    values = series.dropna()
-
-    if len(values) > SAMPLE_SIZE:
-        values = values.sample(SAMPLE_SIZE, random_state=42)
-
-    return values
-
-
-def _result(
-    semantic_type: str,
-    confidence: float,
-    reason: str,
-) -> dict[str, Any]:
-    return {
-        "semantic_type": semantic_type,
-        "confidence": round(max(0.0, min(confidence, 1.0)), 2),
-        "inference_reason": reason,
-    }
 
 
 def infer_semantic_type(
@@ -61,15 +33,16 @@ def infer_semantic_type(
     Infer a column's semantic type.
 
     Returns semantic_type, confidence, and inference_reason.
-    This function does not modify or convert the original series.
+    It does not modify or convert the original series, just returns the above _result values.
     """
-    name = str(column_name or series.name or "")
+    name = normalize_name(str(column_name or series.name or ""))
     values = _sample(series)
 
     if values.empty:
-        return _result("unknown", 0.0, "Column has no non-null values")
+        return _result("unknown", 0.0, "Column has no non null values")
 
-    # Native types take precedence over string-based inference.
+    # Native types take precedence over string based inference.
+    # Native types areint64, float64, bool, or datetime64
     if pd.api.types.is_bool_dtype(series):
         return _result("boolean", 1.0, "Native boolean dtype")
 
@@ -80,7 +53,7 @@ def infer_semantic_type(
         if IDENTIFIER_NAME.search(name):
             return _result(
                 "identifier", 0.98,
-                "Numeric dtype and identifier-like column name",
+                "Numeric dtype and identifier like column name (id, uuid, key)",
             )
         return _result("numeric", 1.0, "Native numeric dtype")
 
@@ -110,16 +83,14 @@ def infer_semantic_type(
         )
 
     # Numeric strings, including negative and decimal values.
-    numeric_values = pd.to_numeric(strings, errors="coerce")
+    numeric_values = parse_numeric(strings)
     numeric_ratio = float(numeric_values.notna().mean())
 
     if numeric_ratio >= NUMERIC_PARSE_THRESHOLD:
-        unique_ratio = strings.nunique() / len(strings)
-
         if IDENTIFIER_NAME.search(name):
             return _result(
                 "identifier", 0.95,
-                "Numeric-looking strings and identifier-like column name",
+                "Numeric looking strings and identifier-like column name",
             )
 
         if (
@@ -128,17 +99,15 @@ def infer_semantic_type(
         ):
             return _result(
                 "boolean", 0.85,
-                "Binary 0/1 values and boolean-like column name",
+                "Binary 0/1 values and boolean like column name",
             )
 
-        # A high-cardinality numeric string column with an identifier-like
-        # name is more convincing than uniqueness alone.
         return _result(
             "numeric", min(0.95, numeric_ratio),
             "Most sampled strings can be parsed as numbers",
         )
 
-    # Date parsing is attempted only when values look date-like or the
+    # Date parsing is attempted only when values look date like or the
     # column name suggests a date, reducing accidental numeric conversions.
     date_like_ratio = float(
         strings.str.match(DATE_PATTERN).mean()
@@ -146,7 +115,7 @@ def infer_semantic_type(
     date_hint = bool(DATE_NAME.search(name))
 
     if date_like_ratio >= DATE_PARSE_THRESHOLD or date_hint:
-        parsed_dates = pd.to_datetime(strings, errors="coerce")
+        parsed_dates = parse_datetimes(strings)
         date_ratio = float(parsed_dates.notna().mean())
 
         if date_ratio >= DATE_PARSE_THRESHOLD:
@@ -164,16 +133,16 @@ def infer_semantic_type(
     ):
         return _result(
             "categorical", 0.85,
-            "Low unique-value ratio and relatively short values",
+            "Low unique value ratio and relatively short values",
         )
 
     if IDENTIFIER_NAME.search(name):
         return _result(
             "identifier", 0.80,
-            "Identifier-like column name with non-numeric values",
+            "Identifier like column name with non numeric values",
         )
 
     return _result(
         "text", 0.80,
-        "Values appear to be free text or high-cardinality strings",
+        "Values appear to be free text or high cardinality strings",
     )

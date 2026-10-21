@@ -1,169 +1,191 @@
 # Returns statistics about the data
 
 
+"""Generate statistical and semantic profiles for a Pandas DataFrame"""
+
+from __future__ import annotations
+
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from app.analysis.semantic_types import (
+    infer_semantic_type,
+    
+)
 
-TOP_N = 3
+from app.analysis.helper import (
+    _clean_number,
+    _numeric_values,
+    _datetime_values,
+    _top_values
+)
+    
 
-
-def _clean_number(value: Any) -> Any:
-    """Convert NumPy scalars and non finite numbers to JSON safe values"""
-    if value is None or pd.isna(value):
-        return None
-
-    if isinstance(value, (np.integer,)):
-        return int(value)
-
-    if isinstance(value, (np.floating, float)):
-        number = float(value)
-        return number if np.isfinite(number) else None
-
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-
-    return value
-
-
-def _column_profile(series: pd.Series) -> dict:
+def _column_profile(
+    series: pd.Series,
+    column_name: str,
+) -> dict[str, Any]:
+    """Build a column profile using shared semantic inference."""
     total = len(series)
-    missing = int(series.isna().sum())
+    missing_count = int(series.isna().sum())
     non_missing = series.dropna()
     unique_count = int(non_missing.nunique())
 
-    result = {
+    # Shared with the quality engine.
+    semantic = infer_semantic_type(series, column_name)
+    semantic_type = semantic["semantic_type"]
+
+    result: dict[str, Any] = {
         "dtype": str(series.dtype),
-        "missing_count": missing,
+        "semantic_type": semantic_type,
+        "semantic_type_confidence": semantic["confidence"],
+        "inference_reason": semantic["inference_reason"],
+        "missing_count": missing_count,
         "missing_percentage": (
-            round(missing / total * 100, 2) if total else 0.0
+            round(missing_count / total * 100, 2)
+            if total
+            else 0.0
         ),
         "unique_count": unique_count,
         "is_constant": unique_count <= 1,
-        "is_all_null": missing == total,
+        "is_all_null": missing_count == total,
     }
 
-    # Numeric columns, excluding boolean columns
-    if pd.api.types.is_numeric_dtype(series) and not (
-        pd.api.types.is_bool_dtype(series)
-    ):
-        result["semantic_type"] = "numeric"
+    # Numeric columns, including numeric strings.
+    # Identifier columns are deliberately excluded.
+    if semantic_type == "numeric":
+        numeric = _numeric_values(series)
 
-        if not non_missing.empty:
-            q1 = non_missing.quantile(0.25)
-            median = non_missing.quantile(0.50)
-            q3 = non_missing.quantile(0.75)
-            iqr = q3 - q1
+        result["statistics"] = None
+
+        if not numeric.empty:
+            q1 = numeric.quantile(0.25)
+            median = numeric.quantile(0.50)
+            q3 = numeric.quantile(0.75)
+            iqr = q3 - q1 # Spread of 50% of the data, used for outlier detection.
 
             lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr
 
+            # With IQR == 0 the fences collapse onto q1/q3 and every value
+            # that differs from them would be flagged. The rule is not
+            # informative there, so report 0 and mark it not applicable
+            # (same behaviour as quality.py).
+            iqr_rule_applicable = bool(np.isfinite(iqr) and iqr > 0)
+
             result["statistics"] = {
-                "mean": _clean_number(non_missing.mean()),
+                "valid_numeric_count": int(len(numeric)),
+                "numeric_parse_failure_count": int(
+                    len(non_missing) - len(numeric)
+                ),
+                "mean": _clean_number(numeric.mean()),
                 "median": _clean_number(median),
-                "std": _clean_number(non_missing.std()),
-                "min": _clean_number(non_missing.min()),
-                "max": _clean_number(non_missing.max()),
+                "std": _clean_number(numeric.std()),
+                "min": _clean_number(numeric.min()),
+                "max": _clean_number(numeric.max()),
                 "q1": _clean_number(q1),
                 "q3": _clean_number(q3),
                 "iqr": _clean_number(iqr),
-                "zero_count": int((non_missing == 0).sum()),
-                "outlier_count_iqr": int(
-                    ((non_missing < lower) | (non_missing > upper)).sum()
+                "zero_count": int((numeric == 0).sum()),
+                "outlier_count_iqr": (
+                    int(((numeric < lower) | (numeric > upper)).sum())
+                    if iqr_rule_applicable
+                    else 0
                 ),
+                "outlier_rule_applicable": iqr_rule_applicable,
             }
-        else:
-            result["statistics"] = None
 
-    elif pd.api.types.is_bool_dtype(series):
-        result["semantic_type"] = "boolean"
+    elif semantic_type == "boolean":
+        normalized = (
+            non_missing.astype("string")
+            .str.strip()
+            .str.casefold()
+        )
+
         result["value_counts"] = {
-            str(key): int(value)
-            for key, value in non_missing.value_counts().items()
+            str(value): int(count)
+            for value, count in normalized.value_counts().items()
         }
 
-    elif pd.api.types.is_datetime64_any_dtype(series):
-        result["semantic_type"] = "datetime"
+    elif semantic_type == "datetime":
+        dates = _datetime_values(series)
 
-        if not non_missing.empty:
+        result["datetime_statistics"] = None
+
+        if not dates.empty:
             result["datetime_statistics"] = {
-                "min": str(non_missing.min()),
-                "max": str(non_missing.max()),
-                "unique_timestamps": unique_count,
+                "valid_datetime_count": int(len(dates)),
+                "datetime_parse_failure_count": int(
+                    len(non_missing) - len(dates)
+                ),
+                "min": str(dates.min()),
+                "max": str(dates.max()),
+                "unique_timestamps": int(dates.nunique()),
             }
-        else:
-            result["datetime_statistics"] = None
 
     else:
-        # semantic classification can be
-        # improved in a dedicated schema inference module
-        avg_length = (
-            non_missing.astype(str).str.len().mean()
-            if not non_missing.empty
-            else 0
-        )
+        # Categorical, text, identifier, structured, and unknown columns.
+        result["top_values"] = _top_values(series)
 
-        result["semantic_type"] = (
-            "text" if avg_length > 50 else "categorical"
-        )
-
-        result["top_values"] = [
-            {
-                "value": str(value),
-                "count": int(count),
-            }
-            for value, count in non_missing.value_counts(
-                dropna=True
-            ).head(TOP_N).items()
-        ]
-
-        result["empty_string_count"] = int(
-            (series.astype("string").str.strip() == "").sum()
-        )
+        if (
+            pd.api.types.is_object_dtype(series)
+            or isinstance(series.dtype, pd.StringDtype)
+            or isinstance(series.dtype, pd.CategoricalDtype)
+        ):
+            string_values = series.astype("string")
+            result["empty_string_count"] = int(
+                (string_values.str.strip() == "").fillna(False).sum()
+            )
+        else:
+            result["empty_string_count"] = 0
 
     return result
 
 
-def profile_dataset(df: pd.DataFrame) -> dict:
-    """Generate a compact statistical profile of a DataFrame"""
-
+def profile_dataset(df: pd.DataFrame) -> dict[str, Any]:
+    """Generate a compact statistical and semantic dataset profile."""
     if not isinstance(df, pd.DataFrame):
         raise TypeError("Expected a pandas DataFrame")
 
+    if df.columns.duplicated().any():
+        raise ValueError(
+            "DataFrame contains duplicate column names; rename them "
+            "before profiling."
+        )
+
     columns = {
-        str(column): _column_profile(df[column])
+        str(column): _column_profile(df[column], str(column))
         for column in df.columns
     }
 
-    numeric_count = sum(
-        1 for profile in columns.values()
-        if profile["semantic_type"] == "numeric"
-    )
-
-    categorical_count = sum(
-        1 for profile in columns.values()
-        if profile["semantic_type"] == "categorical"
-    )
-
-    datetime_count = sum(
-        1 for profile in columns.values()
-        if profile["semantic_type"] == "datetime"
-    )
-
-    boolean_count = sum(
-        1 for profile in columns.values()
-        if profile["semantic_type"] == "boolean"
-    )
+    semantic_counts = {
+        semantic_type: sum(
+            profile["semantic_type"] == semantic_type
+            for profile in columns.values()
+        )
+        for semantic_type in (
+            "numeric",
+            "categorical",
+            "datetime",
+            "boolean",
+            "identifier",
+            "text",
+            "structured",
+            "unknown",
+        )
+    }
 
     all_null_columns = [
-        name for name, profile in columns.items()
+        name
+        for name, profile in columns.items()
         if profile["is_all_null"]
     ]
 
     constant_columns = [
-        name for name, profile in columns.items()
+        name
+        for name, profile in columns.items()
         if profile["is_constant"] and not profile["is_all_null"]
     ]
 
@@ -180,13 +202,14 @@ def profile_dataset(df: pd.DataFrame) -> dict:
             "missing_cells": total_missing,
             "missing_percentage": (
                 round(total_missing / total_cells * 100, 2)
-                if total_cells else 0.0
+                if total_cells
+                else 0.0
             ),
             "duplicate_rows": int(df.duplicated().sum()),
-            "numeric_columns": numeric_count,
-            "categorical_columns": categorical_count,
-            "datetime_columns": datetime_count,
-            "boolean_columns": boolean_count,
+            **{
+                f"{semantic_type}_columns": count
+                for semantic_type, count in semantic_counts.items()
+            },
         },
         "columns": columns,
         "quality": {

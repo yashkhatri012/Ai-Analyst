@@ -30,7 +30,6 @@ async def profile_csv(file: UploadFile = File(...)):
         "profile": profile,
     }
 
-
 @router.post("/datasets/analyze-quality")
 async def analyze_dataset_quality(file: UploadFile = File(...)):
     dataset = await ingest_csv(file)
