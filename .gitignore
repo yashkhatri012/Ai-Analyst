@@ -1,6 +1,8 @@
 tmdb_5000_movies.csv
-
-
+commands.md
+app/agents/analyst_agent.py
+app/llm/prompts/analyst_prompt.py
+sandbox/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
