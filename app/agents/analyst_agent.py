@@ -10,18 +10,18 @@ from app.sandbox.docker_runner import execute_analysis_code
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from app.llm.service import get_llm_for_agent
+from app.analysis.compact import compact 
+
+MAX_ROWS = 20
+MAX_STDOUT = 500
 
 
 class AnalystInput(BaseModel):
-    """Inputs required to execute one analysis step."""
-
-    dataset_id: str
-    dataset_version: int
-
     step: dict[str, Any]
     profile_slice: dict[str, Any]
     sample_rows: list[dict[str, Any]] = Field(default_factory=list)
-
+    dependency_results: dict[int, Any] = Field(default_factory=dict)
+    previous_code: str | None = None
     previous_error: str | None = None
     retry_instructions: str | None = None
 
@@ -51,13 +51,15 @@ async def generate_analysis_code(analyst_input: AnalystInput) -> str:
 
     llm = get_llm_for_agent("analyst")
 
-    prompt_data = analyst_input.model_dump()
+    prompt_data = analyst_input.model_dump(exclude_none=True)
+    prompt_data["step"] = {k: analyst_input.step[k] for k in ("goal", "columns", "method")}
+    content = json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":"), default=str)
 
     
     response = await llm.ainvoke([
         SystemMessage(content=ANALYST_SYSTEM_PROMPT),
         HumanMessage(
-            content=json.dumps(prompt_data, ensure_ascii=False)
+            content=content
         ),
     ])
 
@@ -106,13 +108,15 @@ async def run_analysis(analyst_input: AnalystInput, df) -> AnalystOutput:
         execution = execute_analysis_code(code, df)
 
         # Convert the sandbox response to our output contract.
+        table = [compact(r) for r in (execution.get("result_table") or [])]
         return AnalystOutput(
             step_id=step_id,
             status=execution["status"],
             code=code,
-            result_table=execution.get("result_table") or [],
+            result_table=table[:MAX_ROWS],
+            total_rows=len(table),
             chart_spec=execution.get("chart_spec"),
-            stdout=execution.get("stdout", ""),
+            stdout=execution.get("stdout", "")[:MAX_STDOUT],
             error=execution.get("error"),
         )
 

@@ -16,7 +16,16 @@ Rules:
 9. Do not import modules other than pandas and numpy.
 10. Store the final tabular result in a variable named result.
 11. If creating a chart, store its specification in a variable named chart_spec.
-12. Keep results small and suitable for JSON serialization.
-13. Do not use print as the way to return results.
-14. Return Python code only. Do not use Markdown fences.
+12. Write minimal code: no comments, no helper functions, no prints, no
+    alternative approaches. Compute everything the step needs in one pass.
+13. `result` must be a flat list of dicts (one row per entity), max 20 rows,
+    scalar values only. Never nest dicts. Round floats to 4 decimals.
+14. For a correlation matrix, return one row per column pair
+    (e.g. {"a": "budget", "b": "revenue", "pearson": 0.7308, "spearman": 0.7568}),
+    upper triangle only.
+15. If a quality flag says zeros/nulls are invalid, filter them for the
+    affected columns and include an "n" field with the rows used.
+16. If `previous_code` is given, fix only what the error or retry
+    instructions describe and keep the rest unchanged.
+17. Return Python code only, no Markdown fences.
 """

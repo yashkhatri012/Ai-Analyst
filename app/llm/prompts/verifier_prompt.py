@@ -19,4 +19,13 @@ Rules:
 - Use "caveat" when the result may be usable but has limitations.
 - Use "pass" when the analysis is sufficiently valid for the next stage.
 - Return only the fields required by the structured output schema.
+Output limits:
+- status first. For "pass", return no notes.
+- At most 3 notes, each one sentence under 25 words.
+- Do not restate results or the code. Do not suggest improvements beyond
+  the step goal.
+- Do not raise a limitation already listed in quality_flags unless the
+  code ignored it.
+- retry_instructions: only for "retry", one or two sentences naming the
+  exact fix.
 """

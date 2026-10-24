@@ -148,6 +148,7 @@ async def run_analysis_pipeline(
                 break
 
             if attempt < 2:
+                analyst_input.previous_code = analyst_output.code
                 analyst_input.previous_error = (
                     analyst_output.error
                     or "; ".join(verifier_output.issues)
@@ -168,7 +169,7 @@ async def run_analysis_pipeline(
 
         if verifier_output.status == "caveat":
             all_caveats.extend(verifier_output.caveats)
-            all_caveats.extend(verifier_output.issues)
+           
 
         verified_results.append({
             "step_id": step.id,
@@ -190,9 +191,8 @@ async def run_analysis_pipeline(
         user_question=question,
         plan=analysis_plan.model_dump(),
         verified_results=[
-            result
-            for result in verified_results
-            if result["status"] == "pass"
+            result for result in verified_results
+            if result["status"] in ("pass", "caveat")
         ],
         caveats=all_caveats,
     )

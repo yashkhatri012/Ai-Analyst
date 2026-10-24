@@ -10,42 +10,18 @@ from app.llm.service import get_llm_for_agent
 
 
 class PlanStep(BaseModel):
-    """One analytical operation for the Analyst to execute."""
-
-    id: int = Field(description="Unique step number, starting from 1")
-    goal: str = Field(description="What this step must determine")
-    columns: list[str] = Field(
-        description="Existing dataset columns needed for this step"
-    )
-    method: str = Field(
-        description="Proposed analytical method, not executable code"
-    )
-    depends_on: list[int] = Field(
-        default_factory=list,
-        description="IDs of steps that must finish first"
-    )
-
+    id: int
+    goal: str = Field(max_length=120)
+    columns: list[str]
+    method: str = Field(max_length=200, description="Exact statistic or aggregation, one sentence")
+    depends_on: list[int] = Field(default_factory=list)
 
 class AnalysisPlan(BaseModel):
-    """Structured plan produced by the Planner."""
+    answerable: bool
+    clarification: str | None = None
+    intent: Literal["comparison", "trend", "correlation", "anomaly", "summary"]
+    steps: list[PlanStep] = Field(max_length=3)
 
-    answerable: bool = Field(
-        description="Whether the question can be answered with the available data"
-    )
-    clarification: str | None = Field(
-        default=None,
-        description="Question to ask the user if clarification is necessary"
-    )
-    intent: Literal[
-        "comparison",
-        "trend",
-        "correlation",
-        "anomaly",
-        "summary"
-    ] = Field(description="Primary analytical intent")
-    steps: list[PlanStep] = Field(
-        description="Ordered analytical steps for the Analyst"
-    )
 
 
 async def plan(
@@ -69,5 +45,8 @@ async def plan(
             content=json.dumps(planner_input, ensure_ascii=False)
         ),
     ])
+
+    if len(response.steps) > 3:
+        response.steps = response.steps[:3]
 
     return response
