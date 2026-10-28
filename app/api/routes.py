@@ -1,7 +1,7 @@
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
-
+from app.graph.runner import run_analysis_pipeline
 from app.analysis.context_builder import build_agent_context
 from app.analysis.profiler import profile_dataset
 from app.analysis.quality import analyze_quality
@@ -42,49 +42,18 @@ async def profile_csv(file: UploadFile = File(...)):
         "profile": profile,
     }
 
-@router.post("/datasets/analyze-quality")
-async def analyze_dataset_quality(file: UploadFile = File(...)):
-    dataset = await ingest_csv(file)
-    df = dataset.dataframe
+@router.get("/datasets/analyze-quality")
+async def analyze_dataset_quality():
+    datasetId = "0b4580e7-1564-434a-91dd-8af7fd74a05d"
 
-    context = build_agent_context(dataset.dataframe)
 
+    result = await run_analysis_pipeline(dataset_id=datasetId, question="Analyze the relationship between budget, popularity")
     return {
-        "metadata": dataset.metadata,
-        "context": context
+       
+        "result": result,
     }
 
 class PlannerRequest(BaseModel):
     dataset_id: str
     question: str
 
-
-@router.post("/plan")
-async def create_plan(request: PlannerRequest):
-    try:
-        df = load_dataset(request.dataset_id)
-
-        dataset_context = build_agent_context(df)
-
-        result = await plan(
-            dataset_id=request.dataset_id,
-            question=request.question,
-            dataset_context=dataset_context,
-        )
-
-        print("PLAN RESULT:", repr(result))
-        print("RESULT TYPE:", type(result))
-
-        if result is None:
-            raise HTTPException(
-                status_code=500,
-                detail="plan() returned None. Check planner_agent.py"
-            )
-
-        return result.model_dump()
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e),
-        )
