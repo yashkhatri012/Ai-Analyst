@@ -34,3 +34,8 @@ class AnalystGraphState(TypedDict, total=False):
     step_flags: dict[str, list[dict]]
     final_report: dict
     status: str
+
+    # Conversation and follow up
+    conversation_id: str | None
+    conversation_history: list[dict]
+    followup_decision: dict

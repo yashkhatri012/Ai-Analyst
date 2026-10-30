@@ -22,7 +22,13 @@ from app.graph.routing import (
     route_after_verifier,
 )
 from app.graph.state import AnalystGraphState
+from app.graph.followup_nodes import (
+    resolve_followup_node,
+    finish_context_answer_node,
+    finish_clarification_node,
+)
 
+from app.graph.routing import route_after_followup
 
 def build_graph():
     """Build and compile the AI Analyst StateGraph."""
@@ -39,10 +45,26 @@ def build_graph():
     graph.add_node("finish_empty_plan", finish_empty_plan_node)
     graph.add_node("finish_analysis", finish_analysis_node)
     graph.add_node("reporter", reporter_node)
+    graph.add_node("resolve_followup", resolve_followup_node)
+    graph.add_node("finish_context_answer", finish_context_answer_node)
+    graph.add_node("finish_clarification", finish_clarification_node)
 
-    graph.set_entry_point("load_context")
+    graph.set_entry_point("resolve_followup")
     graph.add_edge("load_context", "planner")
 
+    graph.add_conditional_edges(
+        "resolve_followup",
+        route_after_followup,
+        {
+            "load_context": "load_context",
+            "finish_context_answer": "finish_context_answer",
+            "finish_clarification": "finish_clarification",
+        },
+    )
+
+    graph.add_edge("finish_context_answer", END)
+    graph.add_edge("finish_clarification", END)
+    
     graph.add_conditional_edges("planner", route_after_planner, {
         "finish_unanswerable": "finish_unanswerable",
         "finish_empty_plan": "finish_empty_plan",

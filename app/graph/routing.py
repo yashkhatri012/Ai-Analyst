@@ -33,3 +33,15 @@ def route_after_record(state: AnalystGraphState) -> str:
 
 def route_after_finish_analysis(state: AnalystGraphState) -> str:
     return "reporter" if state.get("status") == "ready_to_report" else "end"
+
+
+def route_after_followup(state: AnalystGraphState) -> str:
+    route = state.get("followup_decision", {}).get("route")
+
+    if route == "context":
+        return "finish_context_answer"
+
+    if route == "clarification":
+        return "finish_clarification"
+
+    return "load_context"

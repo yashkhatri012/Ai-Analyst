@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from sqlalchemy import or_
 from app.db.models import Conversation, ConversationTurn
 
 
@@ -78,7 +78,7 @@ async def get_conversation_history(
         select(ConversationTurn)
         .where(
             ConversationTurn.conversation_id == conversation_id,
-            ConversationTurn.status == "completed",
+            ConversationTurn.status.in_(["completed", "clarification"]),
         )
         .order_by(ConversationTurn.turn_number.desc())
         .limit(limit)

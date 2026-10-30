@@ -7,7 +7,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
-AGENTS = ("planner", "analyst", "verifier", "reporter")
+AGENTS = ("planner", "analyst", "verifier", "reporter", "followup")
 
 
 def get_llm_for_agent(agent_name: str) -> BaseChatModel:
@@ -19,7 +19,7 @@ def get_llm_for_agent(agent_name: str) -> BaseChatModel:
     ).lower()
 
     model = os.getenv(
-        f"{agent_name.upper()}_LLM_MODEL", "gemini-2.5-flash"
+        f"{agent_name.upper()}_LLM_MODEL", "gemini-3.5-flash-lite"
     )
 
     
