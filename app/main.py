@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.api.routes.conversations import router as conversations_router
 from app.db.database import close_database, init_db
+from app.api.routes.datasets import router as datasets_router
 
 
 @asynccontextmanager
@@ -22,3 +23,4 @@ app = FastAPI(
 )
 
 app.include_router(conversations_router)
+app.include_router(datasets_router, prefix="/api")

@@ -1,47 +1,38 @@
-# load and validate csv
+
+import io
 
 import pandas as pd
-from fastapi import UploadFile, HTTPException
-from app.ingestion.models import IngestedDataset
+from fastapi import UploadFile
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
+async def load_csv(file: UploadFile) -> pd.DataFrame:
+    """Validate and load an uploaded CSV into a DataFrame."""
 
-async def ingest_csv(file: UploadFile) -> IngestedDataset:
     if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Please upload a CSV file.")
+        raise ValueError("Only CSV files are supported.")
 
     content = await file.read(MAX_FILE_SIZE + 1)
 
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, "CSV exceeds the 100 MB limit.")
+    if not content:
+        raise ValueError("Uploaded file is empty.")
 
-    if not content.strip():
-        raise HTTPException(400, "The uploaded file is empty.")
+    if len(content) > MAX_FILE_SIZE:
+        raise ValueError("File size exceeds the 100 MB limit.")
 
     try:
-        from io import BytesIO
-        # Let's you read the CSV file from bytes, which is what UploadFile provides
-        df = pd.read_csv(BytesIO(content))
+        df = pd.read_csv(io.BytesIO(content))
+    except (pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Unable to parse CSV: {exc}") from exc
 
-    except (pd.errors.ParserError, pd.errors.EmptyDataError,
-            UnicodeDecodeError, ValueError):
-        raise HTTPException(400, "Invalid or unsupported CSV file.")
+    if df.empty:
+        raise ValueError("CSV contains no data rows.")
 
-    if len(df.columns) == 0:
-        raise HTTPException(400, "CSV contains no columns.")
+    if len(df.columns) == 0 or not df.columns.is_unique:
+        raise ValueError("CSV must have unique columns.")
 
-    metadata = {
-        "filename": file.filename,
-        "rows": len(df),
-        "columns": len(df.columns),
-        "column_names": df.columns.tolist(),
-        "dtypes": df.dtypes.astype(str).to_dict()
-    }
+    if any(not str(column).strip() for column in df.columns):
+        raise ValueError("CSV contains empty column names.")
 
-    return IngestedDataset(
-        dataframe=df,
-        metadata=metadata,
-    )
-
+    return df
